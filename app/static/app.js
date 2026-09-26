@@ -32,6 +32,7 @@ const state = {
   shares: [],      // 主持人：全部观察分享（有效/失效）
   anchors: [],     // 主持人：全部轮次的复盘锚点（参与者/观察者永远为空）
   polls: [],       // 主持人：全部轮次投票；参与者：本轮本组投票；观察者：永远为空
+  vehicles: null,  // 主持人：{total, remaining, requests}；参与者：{my_request}；观察者：null
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
   lastEventId: 0,
@@ -55,6 +56,8 @@ function showRoom() {
   $('#host-console').classList.toggle('hidden', state.role !== 'host');
   // 现场决策投票对观察者完全不可见；主持人与参与者共用列表面板（内容按角色渲染）
   $('#polls-panel').classList.toggle('hidden', state.role === 'observer');
+  // 应急车辆申请对观察者完全不可见；主持人看全量，参与组看本组
+  $('#vehicles-panel').classList.toggle('hidden', state.role === 'observer');
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -890,6 +893,113 @@ async function submitPollVote(poll, optionId, btn) {
   }
 }
 
+/* ---------------------------------------------------------- 应急车辆申请 */
+
+function vehicleStatusBadge(status, position) {
+  const span = document.createElement('span');
+  if (status === 'allocated') {
+    span.className = 'badge vehicle-status-allocated';
+    span.textContent = '已分配';
+  } else {
+    span.className = 'badge vehicle-status-queued';
+    span.textContent = `排队中 · 第 ${position || '?'} 位`;
+  }
+  return span;
+}
+
+/* 主持人：车辆池总量/余量 + 各组申请与队列（服务端按受理顺序下发） */
+function renderHostVehicles() {
+  const v = state.vehicles;
+  // 车辆池创建表单仅未创建时可见（每房间一个，创建后固定）
+  $('#vehicle-pool-form').classList.toggle('hidden', !!v);
+  const summary = $('#vehicle-pool-summary');
+  const list = $('#vehicle-list');
+  list.innerHTML = '';
+  if (!v) {
+    summary.textContent = '尚未创建车辆池：请在上方控制台设置总量（1～20 辆，创建后固定，重置演练保留）。';
+    $('#vehicles-empty').classList.add('hidden');
+    return;
+  }
+  const allocated = v.total - v.remaining;
+  summary.textContent = `车辆池总量 ${v.total} 辆 · 已分配 ${allocated} 辆 · 剩余 ${v.remaining} 辆`
+    + ` · 共 ${v.requests.length} 份申请`;
+  $('#vehicles-empty').classList.toggle('hidden', v.requests.length > 0);
+  for (const r of v.requests) {
+    const li = document.createElement('li');
+    li.className = 'vehicle-item ' + (r.status === 'allocated' ? 'vehicle-allocated' : 'vehicle-queued');
+
+    const name = document.createElement('span');
+    name.className = 'vehicle-group';
+    name.textContent = r.group_name;
+    li.appendChild(name);
+
+    const qty = document.createElement('span');
+    qty.className = 'vehicle-qty';
+    qty.textContent = `申请 ${r.quantity} 辆`;
+    li.appendChild(qty);
+
+    li.appendChild(vehicleStatusBadge(r.status, r.position));
+    list.appendChild(li);
+  }
+}
+
+/* 参与者：仅本组申请状态与排位；无申请时显示提交表单 */
+function renderPlayerVehicles() {
+  const my = state.vehicles ? state.vehicles.my_request : null;
+  const box = $('#vehicle-my');
+  box.innerHTML = '';
+  $('#vehicle-request-form').classList.toggle('hidden', !!my);
+  if (!my) return;
+  const div = document.createElement('div');
+  div.className = 'vehicle-item ' + (my.status === 'allocated' ? 'vehicle-allocated' : 'vehicle-queued');
+
+  const left = document.createElement('span');
+  left.className = 'vehicle-group';
+  left.appendChild(document.createTextNode(`本组申请 ${my.quantity} 辆　`));
+  left.appendChild(vehicleStatusBadge(my.status, my.position));
+  div.appendChild(left);
+
+  const cancel = document.createElement('button');
+  cancel.className = 'vehicle-cancel';
+  cancel.textContent = '取消申请';
+  cancel.title = my.status === 'allocated'
+    ? '取消后已分配车辆释放并自动补位队首，本组可重新申请'
+    : '取消后本组可重新申请';
+  cancel.onclick = () => cancelVehicleRequest(cancel);
+  div.appendChild(cancel);
+
+  if (my.status === 'queued') {
+    const note = document.createElement('div');
+    note.className = 'hint';
+    note.style.width = '100%';
+    note.textContent = `当前排队第 ${my.position} 位：已分配申请取消释放车辆后，系统将从队首依次补位。`;
+    div.appendChild(note);
+  }
+  box.appendChild(div);
+}
+
+function renderVehicles() {
+  if (state.role === 'observer') return;
+  const isHost = state.role === 'host';
+  $('#vehicle-host-view').classList.toggle('hidden', !isHost);
+  $('#vehicle-player-view').classList.toggle('hidden', isHost);
+  if (isHost) renderHostVehicles();
+  else renderPlayerVehicles();
+}
+
+async function cancelVehicleRequest(btn) {
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/api/join/${state.code}/vehicle-requests`);
+    // vehicle_request_cancelled 事件也会到达本组；此处先即时更新
+    if (state.vehicles) state.vehicles.my_request = null;
+    renderVehicles();
+  } catch (err) {
+    showError(err);
+    btn.disabled = false;
+  }
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
@@ -897,6 +1007,7 @@ function renderAll() {
   renderShares();
   renderAnchors();
   renderPolls();
+  renderVehicles();
   renderCards();
 }
 
@@ -944,6 +1055,7 @@ function applySnapshot(msg) {
   state.polls.forEach((p) => {
     p._pastDueKey = p.status === 'open' && p.deadline_ms <= msg.room.elapsed_ms ? 1 : 0;
   });
+  state.vehicles = msg.vehicles || null; // 主持人：全量（无池为 null）；参与者：{my_request}；观察者：缺省
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
   state.round = Number.isInteger(msg.round) ? msg.round : 0;
   state.lastEventId = msg.last_event_id; // 权威水位
@@ -1100,6 +1212,16 @@ function applyEvent(msg) {
         if (poll) poll.status = 'voided';
       }
       break;
+    case 'vehicle_pool_created':
+      // 仅主持人收到：车辆池总量/余量（事件载荷即主持人全量视图）
+      state.vehicles = p;
+      break;
+    case 'vehicle_request_submitted':
+    case 'vehicle_request_cancelled':
+      // 主持人载荷带全量 vehicles；本组参与者只收 {my_request}（服务端已按组过滤）
+      if (state.role === 'host') state.vehicles = p.vehicles;
+      else if (state.role === 'player') state.vehicles = { my_request: p.my_request };
+      break;
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -1117,6 +1239,14 @@ function applyEvent(msg) {
       // 投票：参与者清空本轮投票（作废投票与旧轮结果均不再下发）；
       // 主持人保留全部——未结算投票随后由 poll_voided 标为作废，已结算按轮次保留
       if (state.role !== 'host') state.polls = [];
+      // 应急车辆：清空全部申请并恢复全部余量；车辆池保留（参与者回到未申请状态）
+      if (state.vehicles) {
+        if (state.role === 'host') {
+          state.vehicles = { ...state.vehicles, remaining: state.vehicles.total, requests: [] };
+        } else {
+          state.vehicles = { my_request: null };
+        }
+      }
       state.round += 1; // 重置开启新一轮；锚点不清空，旧锚点仍归属原轮次
       syncClock('idle', 0);
       break;
@@ -1210,6 +1340,7 @@ function enterRoom(code, role) {
   state.shares = [];
   state.anchors = [];
   state.polls = [];
+  state.vehicles = null;
   state.round = 0;
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
@@ -1229,6 +1360,7 @@ function enterObserver(token) {
   state.shares = [];
   state.anchors = [];
   state.polls = [];
+  state.vehicles = null;
   state.round = 0;
   state.groupId = null;
   location.hash = `#/observe/${token}`;
@@ -1445,6 +1577,48 @@ $('#poll-form').onsubmit = async (e) => {
     document.querySelectorAll('#poll-groups input:checked').forEach((el) => { el.checked = false; });
     $('#poll-deadline').value = '';
     $('#poll-question').focus();
+  } catch (err) { showError(err); } finally {
+    btn.disabled = false;
+  }
+};
+
+/* 主持人创建车辆池（每房间一个，1～20 辆，创建后固定；重置演练保留）。
+   成功后由 vehicle_pool_created 事件统一刷新，这里也用返回值即时更新。 */
+$('#vehicle-pool-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const total = parseInt($('#vehicle-pool-total').value, 10);
+  if (!Number.isInteger(total) || total < 1 || total > 20) {
+    showError(new Error('车辆池总量须为 1～20 辆'));
+    return;
+  }
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    const res = await api('POST', `/api/rooms/${state.code}/vehicle-pool`, { total });
+    state.vehicles = res;
+    $('#vehicle-pool-total').value = '';
+    renderVehicles();
+  } catch (err) { showError(err); } finally {
+    btn.disabled = false;
+  }
+};
+
+/* 参与组提交车辆申请（1～5 辆且不超过池总量）；每组一份，取消后才能重新申请。
+   成功由返回值与 vehicle_request_submitted 事件共同保证视图收敛。 */
+$('#vehicle-request-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const quantity = parseInt($('#vehicle-quantity').value, 10);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 5) {
+    showError(new Error('申请数量须为 1～5 辆'));
+    return;
+  }
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    const res = await api('POST', `/api/join/${state.code}/vehicle-requests`, { quantity });
+    state.vehicles = { my_request: res };
+    $('#vehicle-quantity').value = '';
+    renderVehicles();
   } catch (err) { showError(err); } finally {
     btn.disabled = false;
   }

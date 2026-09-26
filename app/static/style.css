@@ -445,3 +445,37 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   flex-wrap: wrap;
   gap: 6px;
 }
+
+/* ---------------------------------------------------------- 应急车辆申请 */
+
+.vehicle-list { list-style: none; margin: 6px 0 4px; padding: 0; }
+.vehicle-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+}
+.vehicle-item.vehicle-allocated { border-left-color: var(--green); }
+.vehicle-item.vehicle-queued    { border-left-color: var(--amber); }
+.vehicle-group { font-weight: 700; flex: 1; min-width: 0; }
+.vehicle-qty {
+  font-family: ui-monospace, monospace;
+  font-size: 13px;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.vehicle-status-allocated { background: rgba(62, 207, 142, .15); color: var(--green); }
+.vehicle-status-queued    { background: rgba(245, 185, 66, .15); color: var(--amber); }
+.vehicle-cancel {
+  background: transparent;
+  color: var(--red);
+  padding: 2px 8px;
+  font-size: 12px;
+  font-weight: 400;
+}

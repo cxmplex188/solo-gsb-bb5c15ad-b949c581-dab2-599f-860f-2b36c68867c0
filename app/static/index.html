@@ -121,6 +121,21 @@
         </div>
       </form>
 
+      <h3>应急车辆申请</h3>
+      <p class="hint">为房间创建一个<strong>总量固定（1～20 辆）</strong>的车辆池（每房间一个，创建后
+        不可改，重置演练保留）。各参与组凭加入码提交<strong>一份 1～5 辆</strong>且不超过总量的申请，
+        取消后才能重新申请。服务端按受理顺序处理：<strong>无更早待分配申请且余量足够才立即分配，
+        否则入队</strong>；取消已分配申请释放车辆后<strong>从队首依次补位，队首数量不足时不跳过</strong>。
+        主持人实时看到各组申请、队列与剩余车辆；参与组只看到本组状态与排位；观察席不可见。</p>
+      <form id="vehicle-pool-form">
+        <div class="share-form-row">
+          <input id="vehicle-pool-total" type="number" min="1" max="20" step="1"
+                 placeholder="车辆池总量（1～20 辆）" required
+                 title="车辆池总量（1～20 辆），创建后固定不可修改">
+          <button type="submit" class="primary">创建车辆池</button>
+        </div>
+      </form>
+
       <h3>添加注入卡片</h3>
       <form id="card-form">
         <div class="form-row">
@@ -160,6 +175,29 @@
         <strong>到期结算后</strong>才能看到结果（最高票获胜，平票按选项顺序决定）。</p>
       <p id="polls-empty" class="hint">暂无投票</p>
       <ul id="poll-list" class="poll-list"></ul>
+    </section>
+
+    <!-- 应急车辆申请（主持人看全量；参与组提交/取消并看本组；观察者完全不可见） -->
+    <section id="vehicles-panel" class="panel hidden">
+      <h2>应急车辆申请</h2>
+      <div id="vehicle-host-view" class="hidden">
+        <p id="vehicle-pool-summary" class="hint"></p>
+        <p id="vehicles-empty" class="hint">暂无申请</p>
+        <ul id="vehicle-list" class="vehicle-list"></ul>
+      </div>
+      <div id="vehicle-player-view" class="hidden">
+        <p class="hint">每组可提交<strong>一份</strong>车辆申请（1～5 辆且不超过车辆池总量）；
+          提交后如需调整请<strong>先取消再重新申请</strong>。分配按受理顺序：无更早排队申请且
+          余量足够时立即分配，否则排队等待补位（队首数量不足时不会跳过队首）。</p>
+        <div id="vehicle-my"></div>
+        <form id="vehicle-request-form" class="hidden">
+          <div class="share-form-row">
+            <input id="vehicle-quantity" type="number" min="1" max="5" step="1"
+                   placeholder="申请数量（1～5 辆）" required title="申请数量（1～5 辆且不超过车辆池总量）">
+            <button type="submit" class="primary">提交车辆申请</button>
+          </div>
+        </form>
+      </div>
     </section>
   </main>
 
