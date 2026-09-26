@@ -32,6 +32,8 @@ const state = {
   shares: [],      // 主持人：全部观察分享（有效/失效）
   anchors: [],     // 主持人：全部轮次的复盘锚点（参与者/观察者永远为空）
   polls: [],       // 主持人：全部轮次投票；参与者：本轮本组投票；观察者：永远为空
+  vehicles: null,   // 主持人：{pool:{total,allocated,remaining}, requests:[...]}；
+                    // 参与者：{pool:{total}|null, my_request:{...}|null}；观察者：null（不下发）
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
   lastEventId: 0,
@@ -55,6 +57,8 @@ function showRoom() {
   $('#host-console').classList.toggle('hidden', state.role !== 'host');
   // 现场决策投票对观察者完全不可见；主持人与参与者共用列表面板（内容按角色渲染）
   $('#polls-panel').classList.toggle('hidden', state.role === 'observer');
+  // 应急车辆申请同样对观察者完全不可见；主持人与参与者共用面板（内容按角色渲染）
+  $('#vehicles-panel').classList.toggle('hidden', state.role === 'observer');
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -890,6 +894,181 @@ async function submitPollVote(poll, optionId, btn) {
   }
 }
 
+/* ---------------------------------------------------------- 应急车辆申请 */
+
+/* 应急车辆面板：主持人建池/看总量余量与全部申请队列；参与组申请/取消、只看本组状态与排位 */
+function renderVehicles() {
+  if (state.role === 'observer') return;
+  const body = $('#vehicle-body');
+  body.innerHTML = '';
+  const v = state.vehicles || { pool: null };
+  if (state.role === 'host') $('#vehicle-hint').textContent =
+    '创建一个总量固定为 1～20 辆的应急车辆池（唯一，创建后不可改）。各参与组凭加入码' +
+    '提交一份 1～5 辆的申请：无更早排队申请且余量足够时立即分配，否则入队；' +
+    '取消已分配申请释放车辆后从队首依次补位，队首数量不足时不会跳过。重置演练清空申请、恢复全部余量，车辆池保留。';
+  else $('#vehicle-hint').textContent =
+    '凭本组加入码提交一份 1～5 辆的应急车辆申请；每组仅可保留一份，取消后才能重新申请。' +
+    '无更早排队申请且余量足够时立即分配，否则按受理顺序入队；你只能看到本组的申请状态与排位。';
+
+  if (state.role === 'host') body.appendChild(hostVehicleBox(v));
+  else body.appendChild(playerVehicleBox(v));
+}
+
+/* 主持人：无池时显示建池表单；有池时显示余量与全部申请（已分配/排队 + 排位） */
+function hostVehicleBox(v) {
+  const box = document.createElement('div');
+  if (!v.pool) {
+    const form = document.createElement('form');
+    form.className = 'vehicle-create';
+    const row = document.createElement('div');
+    row.className = 'share-form-row';
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '1';
+    input.max = '20';
+    input.step = '1';
+    input.placeholder = '车辆池总量（1～20）';
+    input.title = '车辆池总量 1～20 辆，创建后固定不可改';
+    const btn = document.createElement('button');
+    btn.type = 'submit';
+    btn.className = 'primary';
+    btn.textContent = '创建车辆池';
+    row.appendChild(input);
+    row.appendChild(btn);
+    form.appendChild(row);
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const total = parseInt(input.value, 10);
+      if (!Number.isInteger(total) || total < 1 || total > 20) {
+        showError(new Error('车辆池总量须为 1～20'));
+        return;
+      }
+      btn.disabled = true;
+      try {
+        await api('POST', `/api/rooms/${state.code}/vehicle-pool`, { total });
+      } catch (err) { showError(err); btn.disabled = false; }
+    };
+    box.appendChild(form);
+    return box;
+  }
+
+  const head = document.createElement('div');
+  head.className = 'vehicle-summary';
+  const remaining = document.createElement('span');
+  remaining.className = 'vehicle-remaining';
+  remaining.textContent = `剩余 ${v.pool.remaining} 辆`;
+  head.appendChild(remaining);
+  head.appendChild(document.createTextNode(`（总量 ${v.pool.total} · 已分配 ${v.pool.allocated}）`));
+  box.appendChild(head);
+
+  const ul = document.createElement('ul');
+  ul.className = 'vehicle-list';
+  if (!v.requests.length) {
+    const empty = document.createElement('p');
+    empty.className = 'hint';
+    empty.textContent = '暂无参与组提交申请';
+    box.appendChild(empty);
+    return box;
+  }
+  // 服务端已按 (已分配在前, queue_seq) 排序；这里分组展示，队列顺序清晰可见
+  const allocated = v.requests.filter((r) => r.status === 'allocated');
+  const queued = v.requests.filter((r) => r.status === 'queued')
+    .sort((a, b) => (a.queue_position || 0) - (b.queue_position || 0));
+  for (const r of allocated) ul.appendChild(vehicleRow(r, false));
+  for (const r of queued) ul.appendChild(vehicleRow(r, true));
+  box.appendChild(ul);
+  return box;
+}
+
+function vehicleRow(r, queued) {
+  const li = document.createElement('li');
+  li.className = 'vehicle-item ' + (queued ? 'vehicle-queued' : 'vehicle-allocated');
+  const badge = document.createElement('span');
+  badge.className = 'badge ' + (queued ? 'badge-pending' : 'badge-revealed');
+  badge.textContent = queued ? `排队中 · 第 ${r.queue_position} 位` : '✓ 已分配';
+  li.appendChild(badge);
+  const text = document.createElement('span');
+  text.className = 'vehicle-group';
+  text.textContent = `${groupName(r.group_id)} 申请 ${r.amount} 辆`;
+  li.appendChild(text);
+  return li;
+}
+
+/* 参与组：无池时等待主持台建池；有申请时显示状态/排位并可取消，无申请时显示申请表单 */
+function playerVehicleBox(v) {
+  const box = document.createElement('div');
+  if (!v.pool) {
+    const p = document.createElement('p');
+    p.className = 'hint';
+    p.textContent = '主持人尚未创建车辆池。';
+    box.appendChild(p);
+    return box;
+  }
+  const info = document.createElement('div');
+  info.className = 'vehicle-summary';
+  info.textContent = `车辆池总量 ${v.pool.total} 辆（每组每份最多 ${Math.min(5, v.pool.total)} 辆）`;
+  box.appendChild(info);
+
+  const mine = v.my_request;
+  if (mine) {
+    const item = document.createElement('div');
+    item.className = 'vehicle-mine vehicle-' + mine.status;
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + (mine.status === 'allocated' ? 'badge-revealed' : 'badge-pending');
+    badge.textContent = mine.status === 'allocated'
+      ? `✓ 已分配 ${mine.amount} 辆`
+      : `排队中 · 当前第 ${mine.queue_position} 位（申请 ${mine.amount} 辆）`;
+    item.appendChild(badge);
+    const cancel = document.createElement('button');
+    cancel.className = 'group-op group-del';
+    cancel.textContent = '取消申请';
+    cancel.onclick = async () => {
+      if (!confirm('取消本组车辆申请？已分配车辆将立即释放并按队列顺序补位。')) return;
+      cancel.disabled = true;
+      try {
+        await api('DELETE', `/api/join/${state.code}/vehicle-request`);
+      } catch (err) { showError(err); cancel.disabled = false; }
+    };
+    item.appendChild(cancel);
+    box.appendChild(item);
+    return box;
+  }
+
+  const form = document.createElement('form');
+  form.className = 'vehicle-create';
+  const row = document.createElement('div');
+  row.className = 'share-form-row';
+  const max = Math.min(5, v.pool.total);
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = '1';
+  input.max = String(max);
+  input.step = '1';
+  input.placeholder = `申请数量（1～${max}）`;
+  input.title = `每份申请 1～${max} 辆`;
+  const btn = document.createElement('button');
+  btn.type = 'submit';
+  btn.className = 'primary';
+  btn.textContent = '提交申请';
+  row.appendChild(input);
+  row.appendChild(btn);
+  form.appendChild(row);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const amount = parseInt(input.value, 10);
+    if (!Number.isInteger(amount) || amount < 1 || amount > max) {
+      showError(new Error(`申请数量须为 1～${max}`));
+      return;
+    }
+    btn.disabled = true;
+    try {
+      await api('PUT', `/api/join/${state.code}/vehicle-request`, { amount });
+    } catch (err) { showError(err); btn.disabled = false; }
+  };
+  box.appendChild(form);
+  return box;
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
@@ -897,6 +1076,7 @@ function renderAll() {
   renderShares();
   renderAnchors();
   renderPolls();
+  renderVehicles();
   renderCards();
 }
 
@@ -941,6 +1121,8 @@ function applySnapshot(msg) {
   state.shares = msg.shares || []; // 仅主持人快照携带
   state.anchors = msg.anchors || []; // 仅主持人快照携带；参与者/观察者字段缺省
   state.polls = msg.polls || [];  // 主持人全部轮次；参与者本轮本组；观察者缺省为空
+  // 应急车辆申请：主持人 {pool, requests}；参与者 {pool:{total}, my_request}；观察者快照无此字段
+  state.vehicles = msg.vehicles || null;
   state.polls.forEach((p) => {
     p._pastDueKey = p.status === 'open' && p.deadline_ms <= msg.room.elapsed_ms ? 1 : 0;
   });
@@ -1100,6 +1282,16 @@ function applyEvent(msg) {
         if (poll) poll.status = 'voided';
       }
       break;
+    case 'vehicle_pool_created':
+      // 主持人收全量池对象（含余量），参与者收 {total}（无余量/已分配）
+      if (state.vehicles) state.vehicles.pool = state.role === 'host' ? p : { total: p.total };
+      else state.vehicles = state.role === 'host'
+        ? { pool: p, requests: [] } : { pool: { total: p.total }, my_request: null };
+      break;
+    case 'vehicle_requests_updated':
+      // 主持人收 {pool, requests} 全量；参与者由 WS 定向投递按组脱敏视图
+      state.vehicles = p;
+      break;
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -1117,6 +1309,17 @@ function applyEvent(msg) {
       // 投票：参与者清空本轮投票（作废投票与旧轮结果均不再下发）；
       // 主持人保留全部——未结算投票随后由 poll_voided 标为作废，已结算按轮次保留
       if (state.role !== 'host') state.polls = [];
+      // 应急车辆申请：重置清空全部申请、恢复全部余量（车辆池保留）。
+      // 参与者视图清空 my_request；主持人视图清空 requests、余量恢复为总量
+      if (state.vehicles && state.vehicles.pool) {
+        if (state.role === 'host') {
+          state.vehicles.requests = [];
+          state.vehicles.pool.allocated = 0;
+          state.vehicles.pool.remaining = state.vehicles.pool.total;
+        } else {
+          state.vehicles.my_request = null;
+        }
+      }
       state.round += 1; // 重置开启新一轮；锚点不清空，旧锚点仍归属原轮次
       syncClock('idle', 0);
       break;
@@ -1210,6 +1413,7 @@ function enterRoom(code, role) {
   state.shares = [];
   state.anchors = [];
   state.polls = [];
+  state.vehicles = null;
   state.round = 0;
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
@@ -1229,6 +1433,7 @@ function enterObserver(token) {
   state.shares = [];
   state.anchors = [];
   state.polls = [];
+  state.vehicles = null;
   state.round = 0;
   state.groupId = null;
   location.hash = `#/observe/${token}`;

@@ -140,6 +140,27 @@ CREATE TABLE IF NOT EXISTS poll_votes (
     UNIQUE (poll_id, group_id)                       -- 每组只计一票，改投即原地更新
 );
 
+-- 应急车辆申请：每个房间至多一个车辆池（总量 1~20，创建后固定不变）；
+-- 每个参与组在池内至多保留一条申请（1~5 辆且不超过总量），取消后才能重新申请。
+CREATE TABLE IF NOT EXISTS vehicle_pools (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL UNIQUE REFERENCES rooms(id) ON DELETE CASCADE,
+    total      INTEGER NOT NULL,                      -- 车辆池总量（1~20），创建后固定
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS vehicle_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id      INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    group_id     INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    amount       INTEGER NOT NULL,                    -- 申请车辆数（1~5，且 <= 车辆池总量）
+    status       INTEGER NOT NULL DEFAULT 0,           -- 0 = 排队中（queued），1 = 已分配（allocated）
+    queue_seq    INTEGER NOT NULL,                    -- 受理顺序（房间内单调递增），队首补位的决胜键
+    created_at   REAL NOT NULL,
+    allocated_at REAL,                                -- 分配时刻（墙钟秒）；排队中为 NULL
+    UNIQUE (room_id, group_id)                        -- 每组至多一条申请，取消后才能重新申请
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_cards_gate ON cards(depends_on_card_id);
@@ -153,6 +174,9 @@ CREATE INDEX IF NOT EXISTS idx_anchors_room ON anchors(room_id, round, vtime_ms,
 CREATE INDEX IF NOT EXISTS idx_polls_room ON polls(room_id, round, status);
 CREATE INDEX IF NOT EXISTS idx_poll_groups_group ON poll_groups(group_id);
 CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(poll_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_vehicle_pools_room ON vehicle_pools(room_id);
+CREATE INDEX IF NOT EXISTS idx_vehicle_requests_room ON vehicle_requests(room_id, status, queue_seq);
+CREATE INDEX IF NOT EXISTS idx_vehicle_requests_group ON vehicle_requests(group_id);
 """
 
 

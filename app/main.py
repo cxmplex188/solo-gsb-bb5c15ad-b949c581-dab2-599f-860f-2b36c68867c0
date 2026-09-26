@@ -29,6 +29,14 @@
   暂停冻结截止计时，重连与重启恢复状态。主持人实时查看逐组选票与汇总，
   参与者结算前只见自己的选择、结算后才看到结果，观察者完全不可见；
   重置时未结算投票作废，已结算结果按轮次保留
+- 应急车辆申请：主持人为房间创建一个总量固定为 1～20 辆的车辆池（唯一、
+  不可改），各参与组凭组加入码提交一份 1～5 辆且不超过总量的申请，取消后
+  才能重新申请；服务端在 state_lock 内按受理顺序处理——无更早待分配申请且余量
+  足够才立即分配，否则入队；取消已分配申请释放车辆后从队首依次补位，队首
+  数量不足时绝不跳过。主持人看到各组申请、队列与剩余车辆；参与组只看到自己的
+  申请状态与队列排位（看不到他组与余量）；观察席完全不接收。申请与分配结果
+  写入 SQLite，经快照与 WebSocket 恢复；重置演练清空全部申请并恢复全部余量，
+  车辆池保留
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -57,6 +65,7 @@ from pydantic import BaseModel, Field
 from . import db as dbmod
 from . import export as reviewmod
 from . import polls as pollmod
+from . import vehicles as vehmod
 
 log = logging.getLogger("inject")
 logging.basicConfig(level=logging.INFO)
@@ -225,6 +234,77 @@ def poll_player_view(poll: sqlite3.Row, group_id: int) -> dict:
         data["winner_option_id"] = poll["winner_option_id"]
         data["settled_at_ms"] = poll["settled_at_ms"]
         data["tallies"] = [{"option_id": oid, "count": n} for oid, n in tallies.items()]
+    return data
+
+
+# ---------------------------------------------------------------- 应急车辆申请
+
+VEHICLE_QUEUED = "queued"
+VEHICLE_ALLOCATED = "allocated"
+
+
+def vehicle_status_name(req: sqlite3.Row) -> str:
+    return VEHICLE_ALLOCATED if req["status"] == vehmod.STATUS_ALLOCATED else VEHICLE_QUEUED
+
+
+def vehicle_pool_public(pool: sqlite3.Row | None) -> dict | None:
+    if pool is None:
+        return None
+    total = pool["total"]
+    allocated = vehmod.allocated_count(db, pool["room_id"])
+    return {
+        "id": pool["id"],
+        "total": total,
+        "allocated": allocated,
+        "remaining": max(0, total - allocated),
+        "created_at": pool["created_at"],
+    }
+
+
+def vehicle_request_public(req: sqlite3.Row) -> dict:
+    """主持人视野的单条申请：含组 id、数量、状态、队列排位与受理/分配时刻。"""
+    return {
+        "id": req["id"],
+        "group_id": req["group_id"],
+        "amount": req["amount"],
+        "status": vehicle_status_name(req),
+        "queue_position": vehmod.queue_position(db, req["id"]),  # 已分配为 null
+        "queue_seq": req["queue_seq"],
+        "created_at": req["created_at"],
+        "allocated_at": req["allocated_at"],
+    }
+
+
+def vehicle_host_snapshot(room_id: int) -> dict:
+    """主持人视野：车辆池（总量/已分配/剩余）+ 全部申请（含队列排位）。
+
+    申请明细（哪一组申请几辆、排队中还是已分配）只随主持人快照/事件下发；
+    参与者视野走 vehicle_player_view，观察者完全拿不到车辆申请。
+    """
+    pool = vehmod.get_pool(db, room_id)
+    return {
+        "pool": vehicle_pool_public(pool),  # 尚未创建车辆池时为 null
+        "requests": [vehicle_request_public(r) for r in vehmod.list_requests(db, room_id)],
+    }
+
+
+def vehicle_player_view(room_id: int, group_id: int) -> dict:
+    """参与组视野：车辆池总量（不含余量/已分配——会泄露他组申请情况）+
+    本组唯一申请的状态与排位；无申请时 my_request 为 null。"""
+    pool = vehmod.get_pool(db, room_id)
+    data: dict = {"pool": None, "my_request": None}
+    if pool is not None:
+        data["pool"] = {"total": pool["total"]}  # 参与者只知道池总量与单组上限
+        req = vehmod.request_of_group(db, room_id, group_id)
+        if req is not None:
+            data["my_request"] = {
+                "id": req["id"],
+                "amount": req["amount"],
+                "status": vehicle_status_name(req),
+                "queue_position": vehmod.queue_position(db, req["id"]),
+                "created_at": req["created_at"],
+                "allocated_at": req["allocated_at"],
+            }
     return data
 
 
@@ -477,6 +557,8 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             "SELECT * FROM polls WHERE room_id = ? ORDER BY round, id", (room["id"],)
         ).fetchall()
         snapshot["polls"] = [poll_host_view(p) for p in polls]
+        # 应急车辆申请：主持人看到车辆池（总量/已分配/剩余）与全部申请及队列
+        snapshot["vehicles"] = vehicle_host_snapshot(room["id"])
     elif scope is not None:
         # 参与者：只拿当前轮次、白名单包含本组的投票；
         # 已结算投票也由此下发（结算后才可见结果），旧轮次投票一律不可见
@@ -489,6 +571,8 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             (room["id"], round_idx, scope),
         ).fetchall()
         snapshot["polls"] = [poll_player_view(p, scope) for p in polls]
+        # 应急车辆申请：参与者只看到池总量与本组申请状态/排位，看不到他组与余量
+        snapshot["vehicles"] = vehicle_player_view(room["id"], scope)
     return snapshot
 
 
@@ -567,10 +651,12 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
     if scope is None:
         return True
     if type_.startswith("share_") or type_ == "gate_updated" or type_.startswith("anchor_") \
-            or type_ in ("poll_voided", "poll_settled"):
-        # 分享凭证、门槛编排、复盘锚点、投票作废仅主持人可见；
+            or type_ in ("poll_voided", "poll_settled") \
+            or type_ == "vehicle_requests_updated":
+        # 分享凭证、门槛编排、复盘锚点、投票作废、车辆申请明细仅主持人可见；
         # 投票结算对参与者的推送走 Hub.send_poll_event（按组脱敏载荷），
-        # 通用广播只给主持人，避免把逐组选票全量载荷发给参与者。
+        # 车辆申请变化走 Hub.send_vehicle_event（每组只收本组状态/排位），
+        # 通用广播只给主持人，避免把逐组申请/余量全量载荷发给参与者。
         return False
     if isinstance(scope, ObserverScope):
         if type_ in ("card_revealed", "card_removed", "answer_lock_updated"):
@@ -579,8 +665,9 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
         if type_ in ("group_renamed", "group_removed"):
             return payload.get("id") in scope.group_ids
         if type_ in ("card_added", "group_added", "receipt_updated", "answer_updated",
-                     "poll_created", "poll_vote_updated", "poll_settled"):
-            return False  # 观察者完全不可见：未揭示卡、组加入码、回执、答复、投票
+                     "poll_created", "poll_vote_updated", "poll_settled",
+                     "vehicle_pool_created"):
+            return False  # 观察者完全不可见：未揭示卡、组加入码、回执、答复、投票、车辆申请
         return True  # clock / reset 等房间级事件
     if type_ in ("card_added", "card_revealed", "card_removed", "answer_lock_updated"):
         gid = payload.get("group_id")
@@ -678,6 +765,27 @@ class Hub:
                     "id": event_id,
                     "type": type_,
                     "payload": poll_player_view(poll, scope),
+                    "server_now_ms": now_ms(),
+                })
+            except Exception:
+                self.discard(code, ws)
+
+    async def send_vehicle_event(self, code: str, room_id: int, event_id: int) -> None:
+        """向房间内每个在线参与组连接定向投递其车辆申请脱敏载荷。
+
+        主持人已由 publish 收到全量载荷（车辆池余量 + 全部申请/队列），
+        参与者只能收到 vehicle_player_view（池总量 + 本组状态/排位），
+        队列排位变化（他组取消导致本组前移）也由此同步；观察者不投递。
+        """
+        for ws, scope in list(self._rooms.get(code, {}).items()):
+            if not isinstance(scope, int):
+                continue
+            try:
+                await ws.send_json({
+                    "kind": "event",
+                    "id": event_id,
+                    "type": "vehicle_requests_updated",
+                    "payload": vehicle_player_view(room_id, scope),
                     "server_now_ms": now_ms(),
                 })
             except Exception:
@@ -912,11 +1020,20 @@ async def delete_group(code: str, group_id: int):
             raise HTTPException(status_code=409, detail=f"group is targeted by {refs} card(s)")
         db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
         db.commit()
+        # 该组车辆申请经外键级联删除：若删掉的是已分配申请，释放车辆后从队首补位
+        vehicle_event_id: int | None = None
+        if vehmod.get_pool(db, room["id"]) is not None:
+            vehmod.drain_queue(db, room["id"])
+            vehicle_event_id = await publish(
+                room["code"], room["id"], "vehicle_requests_updated",
+                vehicle_host_snapshot(room["id"]))
         await publish(room["code"], room["id"], "group_removed", {"id": group_id})
         # 该组回执已级联删除、全员卡期望组收缩，相关门槛状态随之变化
         await publish_room_gate_refresh(room)
-        # 加入码即刻失效，踢下仍在连接的该组参与者
+        # 加入码即刻失效，踢下仍在连接的该组参与者（先断开，避免其收到车辆脱敏事件）
         await hub.close_scope(room["code"], group_id, {"kind": "error", "message": "所在参与组已被主持人删除"})
+        if vehicle_event_id is not None:
+            await hub.send_vehicle_event(room["code"], room["id"], vehicle_event_id)
         return {"ok": True}
 
 
@@ -1424,8 +1541,91 @@ async def cast_poll_vote(join_code: str, poll_id: int, body: PollVoteIn):
                 "option_id": result.option_id, "changed": not result.first_vote}
 
 
-# ---------------------------------------------------------------- REST：复盘包导出
+# ---------------------------------------------------------------- REST：应急车辆申请
 
+class VehiclePoolIn(BaseModel):
+    total: int = Field(ge=vehmod.MIN_TOTAL, le=vehmod.MAX_TOTAL)  # 车辆池总量 1～20，固定不变
+
+
+class VehicleRequestIn(BaseModel):
+    amount: int = Field(ge=vehmod.MIN_AMOUNT, le=vehmod.MAX_AMOUNT)  # 每组每份申请 1～5 辆
+
+
+@app.post("/api/rooms/{code}/vehicle-pool", status_code=201)
+async def create_vehicle_pool(code: str, body: VehiclePoolIn):
+    """主持人创建房间的应急车辆池：总量 1～20 辆，唯一且创建后固定。
+
+    任意房间状态可创建；每个房间至多一个，重复创建返回 409。重置演练不清
+    车辆池，只清空申请。创建事件下发给主持人（全量）与全部参与组（仅池总量）。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        try:
+            pool = vehmod.create_pool(db, room["id"], body.total)
+        except vehmod.VehicleError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+        payload = vehicle_pool_public(pool)
+        # 参与者只需要知道池总量（单组申请上限不超过它），余量/已分配绝不下发
+        await publish(room["code"], room["id"], "vehicle_pool_created", payload,
+                      player_payload={"total": pool["total"]})
+        return payload
+
+
+@app.put("/api/join/{join_code}/vehicle-request")
+async def submit_vehicle_request(join_code: str, body: VehicleRequestIn):
+    """参与组凭组加入码提交一份 1～5 辆、不超过池总量的车辆申请。
+
+    每组至多一份：已有排队中/已分配申请时返回 409，须先取消才能重新申请。
+    服务端在 state_lock 内按受理顺序处理：无更早待分配申请且余量足够才立即
+    分配，否则入队。返回本组脱敏视图；事件按组下发（他组看不到本组合申请）。
+    """
+    async with state_lock:
+        group = db.execute(
+            "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(status_code=404, detail="join code not found")
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        try:
+            vehmod.submit_request(db, group["room_id"], group["id"], body.amount)
+        except vehmod.VehicleError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+        host_payload = vehicle_host_snapshot(room["id"])
+        event_id = await publish(room["code"], room["id"],
+                                 "vehicle_requests_updated", host_payload)
+        await hub.send_vehicle_event(room["code"], room["id"], event_id)
+        return vehicle_player_view(room["id"], group["id"])
+
+
+@app.delete("/api/join/{join_code}/vehicle-request")
+async def cancel_vehicle_request(join_code: str):
+    """参与组取消本组申请（排队中或已分配均可）。
+
+    取消排队中申请：从队中移除，其后申请排位前移；取消已分配申请：释放车辆，
+    服务端在同一把锁内从队首依次补位——队首数量不足时立即停止，绝不跳过。
+    申请不存在返回 404。取消后本组才可重新申请。
+    """
+    async with state_lock:
+        group = db.execute(
+            "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(status_code=404, detail="join code not found")
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        try:
+            vehmod.cancel_request(db, group["room_id"], group["id"])
+        except vehmod.VehicleError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
+        # 释放车辆后从队首依次补位（取消排队中申请时通常无变化）
+        vehmod.drain_queue(db, room["id"])
+        host_payload = vehicle_host_snapshot(room["id"])
+        event_id = await publish(room["code"], room["id"],
+                                 "vehicle_requests_updated", host_payload)
+        await hub.send_vehicle_event(room["code"], room["id"], event_id)
+        return vehicle_player_view(room["id"], group["id"])
+
+
+# ---------------------------------------------------------------- REST：复盘包导出
 @app.get("/api/rooms/{code}/review.zip")
 async def export_review_zip(code: str):
     """主持人导出复盘 ZIP：按当前事件水位生成自包含离线回放包。
@@ -1518,6 +1718,8 @@ async def reset_room(code: str):
     处置答复一并清空并解除全部锁定，新一轮演练从零开始作答。
     现场决策投票：未结算（open）投票一律作废（选票删除、状态置 voided），
     已结算结果按轮次保留（行内 round 决定归属），作废事件仅主持人可见。
+    应急车辆申请：清空全部申请（排队与已分配），余量恢复为车辆池总量，
+    车辆池本身保留（主持台无需重建即可开始新一轮申请）。
     """
     async with state_lock:
         room = get_room_or_404(code)
@@ -1534,6 +1736,8 @@ async def reset_room(code: str):
         )
         db.execute("DELETE FROM receipts WHERE room_id = ?", (room["id"],))
         db.execute("DELETE FROM answers WHERE room_id = ?", (room["id"],))
+        # 应急车辆申请：重置清空全部申请并恢复全部余量；车辆池（总量配置）保留
+        vehmod.reset_requests(db, room["id"])
         voided_ids = pollmod.void_open_polls(db, room["id"])
         # 注意：anchors 表不在清理之列——复盘锚点跨重置保留，
         # 并以行内 round 归属原轮次（当前轮次已由本 reset 事件 +1）。
